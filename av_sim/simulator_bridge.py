@@ -3,6 +3,7 @@ import rclpy
 from rclpy.node import Node
 import socket
 import json
+import struct
 import time
 import threading
 import math
@@ -191,6 +192,33 @@ class SimulatorBridge(Node):
         # Send initial handshake to simulator
         self.send_json({"msg_type": "car_loaded"})
         self.get_logger().info("State reset and handshake sent to simulator")
+        
+        # Send camera config
+        self.send_camera_config()
+
+    def send_camera_config(self):
+        """Send camera configuration to simulator."""
+        msg = {
+            "msg_type": "cam_config",
+            "fov": "90",
+            "fish_eye_x": "0.0",
+            "fish_eye_y": "0.0",
+            "img_w": "320",
+            "img_h": "240",
+            "img_d": "3",
+            "img_enc": "JPG",
+            "img_quality": "100",
+            "offset_x": "0.0",
+            "offset_y": "0.0",
+            "offset_z": "0.0",
+            "rot_x": "0.0",
+            "rot_y": "0.0",
+            "rot_z": "0.0",
+            "super_sampling": "4",
+            "anti_aliasing": "4",
+        }
+        self.send_json(msg)
+        self.get_logger().info("Sent camera configuration")
 
     def send_json(self, data):
         if not self.connected:
@@ -213,32 +241,29 @@ class SimulatorBridge(Node):
             return
 
         try:
-            # Non-blocking receive
+            # Non-blocking receive - read ALL available data
             self.sock.setblocking(0)
-            try:
-                data = self.sock.recv(4096).decode('utf-8')
-                if not data:
-                    self.connected = False
-                    self.get_logger().warn("Disconnected from simulator")
-                    # Clean up socket to prepare for reconnection
-                    if self.sock is not None:
-                        try:
-                            self.sock.close()
-                        except:
-                            pass
-                        self.sock = None
-                    return
-                self.buffer += data
-            except BlockingIOError:
-                pass # No data available
+            while True:
+                try:
+                    data = self.sock.recv(4096).decode('utf-8')
+                    if not data:
+                        self.connected = False
+                        self.get_logger().warn("Disconnected from simulator")
+                        # Clean up socket to prepare for reconnection
+                        if self.sock is not None:
+                            try:
+                                self.sock.close()
+                            except:
+                                pass
+                            self.sock = None
+                        return
+                    self.buffer += data
+                except BlockingIOError:
+                    break # No more data available right now
 
             # Process buffer
+            messages = []
             while '}' in self.buffer:
-                # Simple JSON extraction (assumes no nested braces for now, or well-formed JSON objects)
-                # Actually, TCP stream might fragment. We need a better delimiter.
-                # The simulator seems to send raw JSON. We can try to decode objects.
-                # A robust way is to count braces.
-                
                 start = self.buffer.find('{')
                 if start == -1:
                     self.buffer = ""
@@ -260,11 +285,24 @@ class SimulatorBridge(Node):
                     self.buffer = self.buffer[end:]
                     try:
                         msg = json.loads(json_str)
-                        self.process_message(msg)
+                        messages.append(msg)
                     except json.JSONDecodeError:
                         self.get_logger().warn(f"Failed to decode JSON: {json_str}")
                 else:
                     break # Incomplete message
+
+            # Process messages, keeping only the latest telemetry
+            latest_telemetry = None
+            for msg in messages:
+                msg_type = msg.get("msg_type")
+                if msg_type == "telemetry":
+                    latest_telemetry = msg
+                else:
+                    self.process_message(msg)
+            
+            # Process the latest telemetry if we have one
+            if latest_telemetry:
+                self.process_message(latest_telemetry)
 
         except Exception as e:
             self.get_logger().error(f"Error receiving data: {e}")
@@ -286,6 +324,9 @@ class SimulatorBridge(Node):
 
     def handle_telemetry(self, msg):
         now = self.get_clock().now().to_msg()
+
+        # debug print all message types
+        #self.get_logger().info(f"Received telemetry: {msg.keys()}")
         
         # 1. Odometry
         if "pos_x" in msg:
@@ -348,8 +389,32 @@ class SimulatorBridge(Node):
             t.transform.rotation.w = 1.0 
             self.tf_broadcaster.sendTransform(t)
 
-        # 2. Lidar
-        if "lidar" in msg:
+        # UnitySensors style Lidar
+        if "lidar_scan" in msg:
+            lidar_data = msg["lidar_scan"]
+            scan = LaserScan()
+            scan.header.stamp = now
+            scan.header.frame_id = "laser"
+            
+            scan.angle_min = float(lidar_data["min_angle"])
+            scan.angle_max = float(lidar_data["max_angle"])
+            scan.angle_increment = float(lidar_data["angle_increment"])
+            scan.range_min = float(lidar_data["range_min"])
+            scan.range_max = float(lidar_data["range_max"])
+            
+            # Decode ranges
+            ranges_b64 = lidar_data["ranges"]
+            ranges_bytes = base64.b64decode(ranges_b64)
+            # Convert bytes to floats
+            # Assuming little-endian (Unity C# uses system endianness, usually little on x86/ARM)
+            # struct.unpack expects bytes.
+            count = len(ranges_bytes) // 4
+            scan.ranges = list(struct.unpack(f'<{count}f', ranges_bytes))
+            
+            self.scan_pub.publish(scan)
+
+        # old donkey-sim based lidar
+        elif "lidar" in msg:
             lidar_data = msg["lidar"]
             scan = LaserScan()
             scan.header.stamp = now
