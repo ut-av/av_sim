@@ -1,0 +1,13 @@
+kind: package
+name: av_sim
+dependencies:
+- rclpy
+- geometry_msgs
+- sensor_msgs
+- nav_msgs
+- std_msgs
+- ut_automata
+- cv_bridge
+- python3-opencv  # cv2.imdecode in sim bridge; was implicit in the old fat base image
+source_path: .
+ros_distro: jazzy
